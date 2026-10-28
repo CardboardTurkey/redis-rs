@@ -103,6 +103,7 @@ use std::{
 };
 
 mod addressed_push_sender;
+mod forward;
 mod request;
 mod routing;
 use crate::{
@@ -135,6 +136,7 @@ use crate::{
 use crate::ProtocolVersion;
 #[cfg(feature = "cache-aio")]
 use crate::caching::{CacheManager, CacheStatistics};
+use forward::forward_requests;
 use futures_channel::mpsc::UnboundedSender;
 use futures_util::{
     future::{self, BoxFuture, FutureExt, select},
@@ -239,10 +241,8 @@ where
                 .send(connect_result)
                 .inspect_err(|e| debug!("failed internal sending with {e:?}"));
 
-            let _ = stream::poll_fn(move |cx| receiver.poll_recv(cx))
-                .map(Ok)
-                .forward(inner)
-                .await;
+            let _ =
+                forward_requests(stream::poll_fn(move |cx| receiver.poll_recv(cx)), inner).await;
         };
         let _task_handle = HandleContainer::new(runtime.spawn(async move {
             select(pin!(request_stream), pin!(reconnect_from_pushes_task)).await;
