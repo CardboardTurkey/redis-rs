@@ -1159,6 +1159,8 @@ struct ClusterConnInner<C> {
     reconnect_futures: stream::FuturesUnordered<BoxFuture<'static, NodeAddress>>,
     pending_requests_rx: mpsc::UnboundedReceiver<PendingRequest<C>>,
     refresh_error: Option<RedisError>,
+    /// Requests taken since the last flush. See [`REQUESTS_PER_FLUSH`].
+    requests_since_flush: usize,
 }
 
 // Keep trying to repair `addr` until it is re-connected, or the node
@@ -1340,6 +1342,7 @@ where
             reconnect_futures: Default::default(),
             pending_requests_rx,
             refresh_error: None,
+            requests_since_flush: 0,
             state: ConnectionState::PollComplete,
         };
         inner.state = ConnectionState::Recover(RecoverFuture::ReconnectInitial(Box::pin(
@@ -1691,18 +1694,49 @@ impl PollFlushAction {
     }
 }
 
+/// Requests [`ClusterConnInner::poll_ready`] lets through between two of its flushes.
+///
+/// A smaller batch leaves more of each poll's budget for sending. With 32, tests in which
+/// each request cost up to four units of budget kept no more than two batches waiting.
+const REQUESTS_PER_FLUSH: usize = 32;
+
 impl<C> Sink<Message<C>> for ClusterConnInner<C>
 where
     C: ConnectionLike + Connect + Clone + Send + Sync + Unpin + 'static,
 {
     type Error = ();
 
-    fn poll_ready(self: Pin<&mut Self>, _cx: &mut task::Context) -> Poll<Result<(), Self::Error>> {
+    /// Flushes before the first request after a flush, and after every
+    /// [`REQUESTS_PER_FLUSH`] requests.
+    ///
+    /// The driver feeds requests in with
+    /// [`StreamExt::forward`](https://github.com/rust-lang/futures-rs/blob/0.3.31/futures-util/src/stream/stream/forward.rs#L47-L74),
+    /// which flushes only when the stream returns `Pending`. Under tokio's multi-thread
+    /// runtime, callers on other threads keep the request channel full, so it returns
+    /// `Pending` only once the task's
+    /// [cooperative budget](https://github.com/tokio-rs/tokio/blob/tokio-1.52.3/tokio/src/task/coop/mod.rs#L105-L117)
+    /// is spent. That flush has no budget left: each request stops at its first tokio sync
+    /// primitive, such as the connection lock, and the connection stalls.
+    ///
+    /// Flushing here sends requests while budget remains. The flush before the first
+    /// request of a poll comes before the poll sends any new request, so requests left from
+    /// the previous poll go first.
+    fn poll_ready(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context,
+    ) -> Poll<Result<(), Self::Error>> {
+        if self.requests_since_flush == 0 || self.requests_since_flush >= REQUESTS_PER_FLUSH {
+            // A pending flush has registered its own wake-up, so the request can still be taken.
+            if let Poll::Ready(Err(err)) = self.as_mut().poll_flush(cx) {
+                return Poll::Ready(Err(err));
+            }
+        }
         Poll::Ready(Ok(()))
     }
 
-    fn start_send(self: Pin<&mut Self>, item: Message<C>) -> Result<(), Self::Error> {
+    fn start_send(mut self: Pin<&mut Self>, item: Message<C>) -> Result<(), Self::Error> {
         trace!("start_send");
+        self.requests_since_flush += 1;
         let Message { cmd, sender } = item;
 
         let _ = self.inner.pending_requests_tx.send(PendingRequest {
@@ -1718,6 +1752,7 @@ where
         cx: &mut task::Context,
     ) -> Poll<Result<(), Self::Error>> {
         trace!("poll_flush: {:?}", self.state);
+        self.requests_since_flush = 0;
         loop {
             self.send_refresh_error();
 
@@ -2065,5 +2100,133 @@ mod tests {
             pipelines[&replica1].get_packed_pipeline(),
             expected.get_packed_pipeline()
         );
+    }
+
+    /// Connection that answers every command at once, as the only node of a cluster.
+    ///
+    /// Each reply first spends `EXTRA_BUDGET` units of tokio's cooperative budget, so a
+    /// request costs that many units more than its connection lock.
+    #[derive(Clone)]
+    struct InstantConnection<const EXTRA_BUDGET: usize>;
+
+    impl<const EXTRA_BUDGET: usize> ConnectionLike for InstantConnection<EXTRA_BUDGET> {
+        fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, Value> {
+            let is_slots = cmd.get_packed_command() == slot_cmd().get_packed_command();
+            Box::pin(async move {
+                for _ in 0..EXTRA_BUDGET {
+                    tokio::task::coop::consume_budget().await;
+                }
+                if !is_slots {
+                    return Ok(Value::Okay);
+                }
+                Ok(Value::Array(vec![Value::Array(vec![
+                    Value::Int(0),
+                    Value::Int(16383),
+                    Value::Array(vec![Value::BulkString(b"node".to_vec()), Value::Int(6379)]),
+                ])]))
+            })
+        }
+
+        fn req_packed_commands<'a>(
+            &'a mut self,
+            _pipeline: &'a crate::Pipeline,
+            _offset: usize,
+            _count: usize,
+        ) -> RedisFuture<'a, Vec<Value>> {
+            unreachable!("these tests send no pipelines")
+        }
+
+        fn get_db(&self) -> i64 {
+            0
+        }
+    }
+
+    impl<const EXTRA_BUDGET: usize> Connect for InstantConnection<EXTRA_BUDGET> {
+        fn connect_with_config<'a, T>(
+            _info: T,
+            _config: AsyncConnectionConfig,
+        ) -> RedisFuture<'a, Self>
+        where
+            T: IntoConnectionInfo + Send + 'a,
+        {
+            Box::pin(async { Ok(Self) })
+        }
+    }
+
+    /// Requests taken by and answered through a connection fed by a channel that never empties.
+    struct Throughput {
+        taken: usize,
+        answered: usize,
+    }
+
+    /// Feeds requests into the connection until `target` are answered or 5 s pass.
+    ///
+    /// Each request spends budget, like the tokio channel, and is always ready, like a
+    /// channel that callers keep full.
+    async fn feed_full_channel<const EXTRA_BUDGET: usize>(target: usize) -> Throughput {
+        let nodes = ["redis://node:6379".into_connection_info().unwrap()];
+        let (push_sender, _push_receiver) = futures_channel::mpsc::unbounded();
+        let mut connection = ClusterConnInner::<InstantConnection<EXTRA_BUDGET>>::new(
+            &nodes,
+            ClusterParams::default(),
+            push_sender,
+            false,
+        );
+        connection.wait_for_initial_connection().await.unwrap();
+
+        let taken = Arc::new(AtomicUsize::new(0));
+        let answered = Arc::new(AtomicUsize::new(0));
+        let (taken_count, answered_count) = (taken.clone(), answered.clone());
+        let requests = stream::poll_fn(move |cx| {
+            ready!(tokio::task::coop::poll_proceed(cx)).made_progress();
+            taken_count.fetch_add(1, Ordering::SeqCst);
+            let (sender, receiver) = oneshot::channel();
+            let answered_count = answered_count.clone();
+            tokio::spawn(async move {
+                if let Ok(Ok(_)) = receiver.await {
+                    answered_count.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            let mut cmd = crate::cmd("SET");
+            cmd.arg("key").arg("value");
+            let routing = RoutingInfo::for_routable(&cmd).unwrap();
+            Poll::Ready(Some(Ok(Message {
+                cmd: CmdArg::Cmd {
+                    cmd: Arc::new(cmd),
+                    routing: routing.into(),
+                },
+                sender: ResultExpectation::External(sender),
+            })))
+        });
+        let forward = tokio::spawn(requests.forward(connection));
+
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            while answered.load(Ordering::SeqCst) < target {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        forward.abort();
+        Throughput {
+            taken: taken.load(Ordering::SeqCst),
+            answered: answered.load(Ordering::SeqCst),
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_sends_while_the_request_channel_stays_full() {
+        let throughput = feed_full_channel::<0>(1_000).await;
+        assert!(throughput.answered >= 1_000);
+    }
+
+    #[tokio::test]
+    async fn forward_keeps_up_when_requests_cost_more_budget() {
+        for throughput in [
+            feed_full_channel::<2>(20_000).await,
+            feed_full_channel::<3>(20_000).await,
+        ] {
+            assert!(throughput.answered >= 20_000);
+            assert!(throughput.taken - throughput.answered <= 2 * REQUESTS_PER_FLUSH);
+        }
     }
 }
